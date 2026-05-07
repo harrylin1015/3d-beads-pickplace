@@ -1,7 +1,7 @@
-# Pick-and-Place X-Axis Controller
+# Pick-and-Place Controller
 
-Two-file project: Arduino firmware for a Raspberry Pi Pico + a Python/Tkinter desktop app.  
-Controls one stepper motor (X axis / heated-bed movement) over USB serial.
+Two-file project: Arduino firmware for a Raspberry Pi Pico W + a Python/Tkinter desktop app.  
+Controls up to three stepper motors (X, Y, Z axes) over USB serial.
 
 ---
 
@@ -83,21 +83,28 @@ python pickplace_app.py
 
 1. **Connection bar** — select the Pico's COM/tty port from the dropdown, click **Refresh** if it's missing, then **Connect**. The dot turns green and you should see `< READY` in the log.
 2. **Motion settings** — set the jog step size (in steps) and the inter-step delay (lower µs = faster). Click **Set Speed** to push the speed to the firmware.
-3. **Jog X** — **−X** and **+X** buttons move by one step-size. Buttons are grayed out while a move is in progress.
-4. **Position** — tracks cumulative steps. **Set as Zero** redefines the current position as logical 0. **Home** returns to logical position 0.
-5. **Saved Positions** — click **Save** on Pickup or Drop to record the current position; click **Go** to move there.
+3. **Jog axes** — each axis (X, Y, Z) has **−** and **+** buttons that move by one step-size. Buttons are grayed out while a move is in progress.
+4. **Position** — each axis tracks cumulative steps. **Set as Zero** redefines the current position as logical 0. **Home** returns to logical position 0.
+5. **Saved Positions** — click **Save** on Pickup or Drop to record the current X position; click **Go** to move there.
 6. **Log** — shows every sent command (`>`) and every firmware reply (`<`).
 
-Soft limits prevent the machine from being commanded outside `[0, 550]` steps (absolute). Change `X_LIMIT_MAX` at the top of `pickplace_app.py` if your travel range differs.
+**Soft limits:** Per-axis bounds can be set in `AXIS_LIMITS` at the top of `pickplace_app.py`. Set either bound to `None` to disable it. All axes are currently unlimited.
 
 ---
 
-## Adding a Second Axis (Future)
+## Serial Protocol
 
-The code is structured for easy expansion:
+Newline-terminated ASCII commands:
 
-- **Firmware:** add `PIN_Y_STEP`, `PIN_Y_DIR` constants and a `stepY()` function mirroring `stepX()`. Add `Y+<n>` / `Y-<n>` branches to the command parser.
-- **App:** add `Y_LIMIT_MIN`/`MAX` constants, a `y_pos` variable, `jog_y()` and `do_move_y()` functions mirroring the X equivalents, and new jog buttons appended to `_motion_controls`. The threading, busy-flag, and reply-queue logic are shared and need no changes.
+| Command | Example | Effect |
+|---------|---------|--------|
+| `X±<n>` | `X+100` | Move X axis by n steps |
+| `Y±<n>` | `Y-50`  | Move Y axis by n steps |
+| `Z±<n>` | `Z+10`  | Move Z axis by n steps |
+| `S<µs>` | `S3000` | Set inter-step delay (speed) |
+| `P`     | `P`     | Ping |
+
+Firmware replies: `DONE`, `PONG`, `ERR <cmd>`, `READY`
 
 ---
 
@@ -117,8 +124,9 @@ The code is structured for easy expansion:
 
 | Constant | Default | Meaning |
 |----------|---------|---------|
-| `BAUD_RATE`     | 9600    | Must match firmware |
-| `X_LIMIT_MIN`   | 0       | Soft lower bound (steps) |
-| `X_LIMIT_MAX`   | 550     | Soft upper bound (steps) |
-| `DEFAULT_STEP`  | 50      | Initial jog step size |
-| `DEFAULT_SPEED` | 5000    | Initial speed sent on connect |
+| `BAUD_RATE`     | 9600   | Must match firmware |
+| `DEFAULT_STEP`  | 50     | Initial jog step size (steps) |
+| `DEFAULT_SPEED` | 5000   | Initial inter-step delay sent on connect (µs) |
+| `POLL_MS`       | 50     | How often the main thread checks for firmware replies |
+| `BUSY_TIMEOUT`  | 10.0 s | Watchdog: force-clears busy flag if firmware never replies |
+| `AXIS_LIMITS`   | all `None` | Per-axis soft limits `(min, max)`; `None` disables a bound |
