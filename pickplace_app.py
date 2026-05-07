@@ -522,9 +522,26 @@ def run_pattern() -> None:
 
     _log(f"starting pattern: {len(cells)} bead(s)")
 
+    x_center = (_X_LO + _X_HI) // 2
+    y_center = (_Y_LO + _Y_HI) // 2
+
+    def return_to_zero():
+        dx = -axis_pos["X"]
+        dy = -axis_pos["Y"]
+        _log(f"returning to zero → X=0 Y=0  (Δx={dx:+d} Δy={dy:+d})")
+        parts = [f"{ax}{'+' if d > 0 else ''}{d}" for ax, d in (("X", dx), ("Y", dy)) if d != 0]
+        if not parts:
+            return
+        def on_done():
+            axis_pos["X"] = 0
+            axis_pos["Y"] = 0
+            _refresh_pos_labels()
+        send_command("M " + " ".join(parts), on_done=on_done)
+
     def place_next(remaining):
         if not remaining:
             _log("pattern complete")
+            return_to_zero()
             return
         row, col = remaining[0]
         x_target = GRID_X_ORIGIN + col * STEPS_PER_BEAD
@@ -540,7 +557,12 @@ def run_pattern() -> None:
 
         _send_multi(moves, after=on_placed)
 
-    place_next(cells)
+    # Step 1 — move to centre of work area before starting pattern
+    dx_c = x_center - axis_pos["X"]
+    dy_c = y_center - axis_pos["Y"]
+    _log(f"moving to centre → X={x_center} Y={y_center}  (Δx={dx_c:+d} Δy={dy_c:+d})")
+    _send_multi([(ax, d) for ax, d in (("X", dx_c), ("Y", dy_c)) if d != 0],
+                after=lambda: place_next(cells))
 
 
 _btn_row = tk.Frame(left_frame)
