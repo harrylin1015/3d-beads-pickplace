@@ -20,16 +20,16 @@ import time
 
 # ── Easy-to-change constants ───────────────────────────────────────────────
 BAUD_RATE     = 9600
-DEFAULT_STEP  = 50      # initial jog step size (steps)
-DEFAULT_SPEED = 5000    # initial inter-step delay sent to firmware (µs)
+DEFAULT_STEP  = 0       # initial jog step size (steps)
+DEFAULT_SPEED = 2000    # initial inter-step delay sent to firmware (µs)
 POLL_MS       = 50      # how often the main thread drains the reply queue
 BUSY_TIMEOUT  = 10.0    # seconds before the busy flag is force-cleared (watchdog)
 
-# Soft limits per axis — None disables that bound.
-# Add Y/Z values once travel distances are known.
+STEPS_PER_BEAD = 5      # steps per 5 mm bead width
+
 AXIS_LIMITS = {
-    "X": (None, None),
-    "Y": (None, None),
+    "X": (50,   495),
+    "Y": (50,   900),
     "Z": (None, None),
 }
 
@@ -44,9 +44,6 @@ pending_action = None   # zero-arg callable invoked when DONE arrives
 # Per-axis position tracking. Values are absolute machine steps.
 axis_pos  = {"X": 0, "Y": 0, "Z": 0}
 axis_zero = {"X": 0, "Y": 0, "Z": 0}  # display = axis_pos − axis_zero
-
-# Saved positions for the X axis (Pickup / Drop). Stored as logical steps.
-saved_pos = {"Pickup": None, "Drop": None}
 
 # Thread-safe queue: reader thread writes, main thread reads.
 reply_q: queue.Queue = queue.Queue()
@@ -166,12 +163,15 @@ def poll_replies() -> None:
 # Motion helpers
 # ══════════════════════════════════════════════════════════════════════════════
 
-def do_move(axis: str, delta: int) -> None:
+def do_move(axis: str, delta: int, after=None) -> None:
     """
     Validate delta against soft limits for the given axis, then send the move.
     Position is updated optimistically inside on_done (after firmware confirms).
+    after, if provided, is called once the move completes — used to chain multi-axis moves.
     """
     if delta == 0:
+        if after:
+            after()
         return
 
     cur     = axis_pos[axis]
@@ -190,19 +190,91 @@ def do_move(axis: str, delta: int) -> None:
     def on_done(ax=axis, target=new_abs):
         axis_pos[ax] = target
         _refresh_pos_labels()
+        if after:
+            after()
 
     send_command(f"{axis}{sign}{delta}", on_done=on_done)
 
 
 def jog(axis: str, direction: int) -> None:
     try:
-        step = int(step_var.get())
+        step = int(step_vars[axis].get())
         if step <= 0:
             raise ValueError
     except ValueError:
-        _log("invalid step size — must be a positive integer")
+        _log(f"invalid step size for {axis} — must be a positive integer")
         return
     do_move(axis, direction * step)
+
+
+def move_by_entry(axis: str) -> None:
+    try:
+        steps = int(step_vars[axis].get())
+    except ValueError:
+        _log(f"invalid step count for {axis} — must be an integer")
+        return
+    do_move(axis, steps)
+
+
+def _send_multi(moves: list, after=None) -> None:
+    """
+    Send an M command for a list of (axis, delta) pairs.
+    Validates limits, builds the command, and updates positions on DONE.
+    after() is called once the move completes — used to chain pattern moves.
+    """
+    if not moves:
+        if after:
+            after()
+        return
+
+    for axis, delta in moves:
+        cur = axis_pos[axis]
+        new_abs = cur + delta
+        lo, hi = AXIS_LIMITS[axis]
+        if lo is not None and new_abs < lo:
+            _log(f"LIMIT: {axis} {cur}{delta:+d} = {new_abs} < {lo} — move refused")
+            return
+        if hi is not None and new_abs > hi:
+            _log(f"LIMIT: {axis} {cur}{delta:+d} = {new_abs} > {hi} — move refused")
+            return
+
+    parts = [f"{ax}{'+' if d > 0 else ''}{d}" for ax, d in moves]
+    targets = {ax: axis_pos[ax] + d for ax, d in moves}
+
+    def on_done():
+        for ax, target in targets.items():
+            axis_pos[ax] = target
+        _refresh_pos_labels()
+        if after:
+            after()
+
+    send_command("M " + " ".join(parts), on_done=on_done)
+
+
+def home_all_axes() -> None:
+    moves = [(a, axis_zero[a] - axis_pos[a]) for a in ("X", "Y", "Z")
+             if axis_pos[a] != axis_zero[a]]
+    if not moves:
+        _log("all axes already at home")
+        return
+    _send_multi(moves)
+
+
+def go_all_axes() -> None:
+    moves = []
+    for axis in ("X", "Y", "Z"):
+        try:
+            steps = int(step_vars[axis].get())
+        except ValueError:
+            _log(f"invalid step count for {axis} — skipping")
+            continue
+        if steps != 0:
+            moves.append((axis, steps))
+
+    if not moves:
+        _log("no moves to execute — all step values are 0")
+        return
+    _send_multi(moves)
 
 
 def set_zero(axis: str) -> None:
@@ -230,21 +302,6 @@ def set_speed() -> None:
     send_command(f"S{us}")
 
 
-# ── Saved positions (X axis only) ──────────────────────────────────────────
-
-def save_position(slot: str) -> None:
-    lpos = axis_pos["X"] - axis_zero["X"]
-    saved_pos[slot] = lpos
-    saved_labels[slot].set(f"{lpos} steps")
-    _log(f"saved {slot} = {lpos} steps")
-
-
-def go_to_saved(slot: str) -> None:
-    if saved_pos[slot] is None:
-        _log(f"{slot} position not set")
-        return
-    target_abs = saved_pos[slot] + axis_zero["X"]
-    do_move("X", target_abs - axis_pos["X"])
 
 
 # ── Connection management ──────────────────────────────────────────────────
@@ -330,7 +387,7 @@ def _log(msg: str) -> None:
 
 root = tk.Tk()
 root.title("Pick-and-Place Controller")
-root.resizable(False, False)
+root.resizable(True, False)
 
 
 def _make_btn(parent, **kwargs) -> tk.Button:
@@ -354,8 +411,145 @@ def _make_btn(parent, **kwargs) -> tk.Button:
 
 PAD = dict(padx=6, pady=4)
 
+# ── Top-level layout: grid on left, controls on right ─────────────────────
+main_frame = tk.Frame(root)
+main_frame.pack(fill="both", expand=True)
+
+left_frame = tk.Frame(main_frame)
+left_frame.pack(side="left", fill="y", padx=(6, 0), pady=6)
+
+right_frame = tk.Frame(main_frame)
+right_frame.pack(side="left", fill="both", expand=True)
+
+# ── Pattern grid ───────────────────────────────────────────────────────────
+_GRID_N     = 10
+_CELL       = 18
+_GAP        = 1
+_CANVAS_PX  = _GRID_N * (_CELL + _GAP) + _GAP
+_COL_EMPTY  = "#555555"
+_COL_FILLED = "#ffffff"
+_COL_DONE   = "#00cc44"
+
+# Grid origin: centre the 10×10 bead grid in the usable work area
+_X_LO, _X_HI = AXIS_LIMITS["X"]
+_Y_LO, _Y_HI = AXIS_LIMITS["Y"]
+GRID_X_ORIGIN = (_X_LO + _X_HI) // 2 - (_GRID_N * STEPS_PER_BEAD) // 2
+GRID_Y_ORIGIN = (_Y_LO + _Y_HI) // 2 - (_GRID_N * STEPS_PER_BEAD) // 2
+
+grid_state = [[False] * _GRID_N for _ in range(_GRID_N)]
+
+grid_lf = tk.LabelFrame(left_frame, text="Pattern Grid", padx=4, pady=4)
+grid_lf.pack(fill="both", expand=True)
+
+grid_canvas = tk.Canvas(grid_lf, bg="#2e2e2e", highlightthickness=0)
+grid_canvas.pack(fill="both", expand=True)
+
+_cell_ids = [[None] * _GRID_N for _ in range(_GRID_N)]
+for _r in range(_GRID_N):
+    for _c in range(_GRID_N):
+        _cell_ids[_r][_c] = grid_canvas.create_rectangle(
+            0, 0, 1, 1, fill=_COL_EMPTY, outline=""
+        )
+
+_live_cell = _CELL  # updated on every Configure event
+
+
+def _redraw_grid(event=None) -> None:
+    global _live_cell
+    w = grid_canvas.winfo_width()
+    h = grid_canvas.winfo_height()
+    size = min(w, h)
+    cell = max(1, (size - (_GRID_N + 1) * _GAP) // _GRID_N)
+    _live_cell = cell
+    for r in range(_GRID_N):
+        for c in range(_GRID_N):
+            x0 = _GAP + c * (cell + _GAP)
+            y0 = _GAP + r * (cell + _GAP)
+            grid_canvas.coords(_cell_ids[r][c], x0, y0, x0 + cell, y0 + cell)
+
+
+grid_canvas.bind("<Configure>", _redraw_grid)
+
+
+def _set_cell(row, col, filled: bool) -> None:
+    grid_state[row][col] = filled
+    grid_canvas.itemconfig(_cell_ids[row][col],
+                           fill=_COL_FILLED if filled else _COL_EMPTY)
+
+
+def _cell_at(event):
+    col = (event.x - _GAP) // (_live_cell + _GAP)
+    row = (event.y - _GAP) // (_live_cell + _GAP)
+    if 0 <= row < _GRID_N and 0 <= col < _GRID_N:
+        return row, col
+    return None, None
+
+
+_drag_fill = None
+
+
+def _on_grid_press(event) -> None:
+    global _drag_fill
+    row, col = _cell_at(event)
+    if row is None:
+        return
+    _drag_fill = not grid_state[row][col]
+    _set_cell(row, col, _drag_fill)
+
+
+def _on_grid_drag(event) -> None:
+    row, col = _cell_at(event)
+    if row is not None and grid_state[row][col] != _drag_fill:
+        _set_cell(row, col, _drag_fill)
+
+
+grid_canvas.bind("<Button-1>", _on_grid_press)
+grid_canvas.bind("<B1-Motion>", _on_grid_drag)
+
+
+def clear_grid() -> None:
+    for r in range(_GRID_N):
+        for c in range(_GRID_N):
+            if grid_state[r][c]:
+                _set_cell(r, c, False)
+
+
+def run_pattern() -> None:
+    cells = [(r, c) for r in range(_GRID_N) for c in range(_GRID_N) if grid_state[r][c]]
+    if not cells:
+        _log("no cells selected in pattern")
+        return
+
+    _log(f"starting pattern: {len(cells)} bead(s)")
+
+    def place_next(remaining):
+        if not remaining:
+            _log("pattern complete")
+            return
+        row, col = remaining[0]
+        x_target = GRID_X_ORIGIN + col * STEPS_PER_BEAD
+        y_target = GRID_Y_ORIGIN + row * STEPS_PER_BEAD
+        dx = x_target - axis_pos["X"]
+        dy = y_target - axis_pos["Y"]
+        _log(f"grid ({row},{col}) → X={x_target} Y={y_target}  (Δx={dx:+d} Δy={dy:+d})")
+        moves = [(ax, d) for ax, d in (("X", dx), ("Y", dy)) if d != 0]
+
+        def on_placed():
+            grid_canvas.itemconfig(_cell_ids[row][col], fill=_COL_DONE)
+            place_next(remaining[1:])
+
+        _send_multi(moves, after=on_placed)
+
+    place_next(cells)
+
+
+_btn_row = tk.Frame(left_frame)
+_btn_row.pack(pady=(6, 2))
+_make_btn(_btn_row, text="Run Pattern", command=run_pattern).pack(side="left", padx=4)
+_make_btn(_btn_row, text="Clear All",   command=clear_grid).pack(side="left", padx=4)
+
 # ── 1. Connection bar ──────────────────────────────────────────────────────
-conn_frame = tk.LabelFrame(root, text="Connection", padx=4, pady=4)
+conn_frame = tk.LabelFrame(right_frame, text="Connection", padx=4, pady=4)
 conn_frame.pack(fill="x", **PAD)
 
 port_var = tk.StringVar()
@@ -369,14 +563,10 @@ status_dot = tk.Label(conn_frame, text="●", fg="red", font=("Arial", 16))
 status_dot.pack(side="left", padx=(2, 6))
 
 # ── 2. Motion settings ─────────────────────────────────────────────────────
-motion_frame = tk.LabelFrame(root, text="Motion Settings", padx=4, pady=4)
+motion_frame = tk.LabelFrame(right_frame, text="Motion Settings", padx=4, pady=4)
 motion_frame.pack(fill="x", **PAD)
 
-tk.Label(motion_frame, text="Step size (steps):").pack(side="left", **PAD)
-step_var = tk.StringVar(value=str(DEFAULT_STEP))
-tk.Entry(motion_frame, textvariable=step_var, width=6).pack(side="left", **PAD)
-
-tk.Label(motion_frame, text="  Speed (µs):").pack(side="left")
+tk.Label(motion_frame, text="Speed (µs):").pack(side="left")
 speed_var = tk.StringVar(value=str(DEFAULT_SPEED))
 tk.Entry(motion_frame, textvariable=speed_var, width=7).pack(side="left", **PAD)
 
@@ -390,11 +580,14 @@ speed_btn.pack(side="left", **PAD)
 #   Y:     …
 #   Z:     …
 #
-axes_frame = tk.LabelFrame(root, text="Axes", padx=6, pady=6)
+axes_frame = tk.LabelFrame(right_frame, text="Axes", padx=6, pady=6)
 axes_frame.pack(fill="x", **PAD)
 
 pos_vars: dict[str, tk.StringVar] = {}
+step_vars: dict[str, tk.StringVar] = {}
 _motion_controls: list[tk.Widget] = [speed_btn]  # start with speed_btn; axes buttons added below
+
+axis_max_hint = {"X": "50–495", "Y": "50–900", "Z": ""}
 
 for row, axis in enumerate(("X", "Y", "Z")):
     tk.Label(axes_frame, text=f"{axis}", width=2, anchor="e",
@@ -412,42 +605,43 @@ for row, axis in enumerate(("X", "Y", "Z")):
                          command=lambda a=axis: go_home(a))
     home_btn.grid(row=row, column=3, padx=6)
 
+    sv = tk.StringVar(value=str(DEFAULT_STEP))
+    step_vars[axis] = sv
+    step_entry = tk.Entry(axes_frame, textvariable=sv, width=7, justify="right")
+    step_entry.grid(row=row, column=4, padx=2)
+    step_entry.bind("<Return>", lambda e, a=axis: move_by_entry(a))
+
+    tk.Label(axes_frame, text="steps").grid(row=row, column=5, padx=(0, 8))
+
     pv = tk.StringVar(value="0 steps")
     pos_vars[axis] = pv
     tk.Label(axes_frame, textvariable=pv, width=11, anchor="w",
-             font=("Courier", 11, "bold")).grid(row=row, column=4, padx=4)
+             font=("Courier", 11, "bold")).grid(row=row, column=6, padx=4)
 
     # "Set Zero" needs no connection — it's a local reference change.
     _make_btn(axes_frame, text="Set Zero",
-              command=lambda a=axis: set_zero(a)).grid(row=row, column=5, padx=2)
+              command=lambda a=axis: set_zero(a)).grid(row=row, column=7, padx=2)
+
+    tk.Label(axes_frame, text=axis_max_hint[axis], fg="gray", font=("Arial", 9)
+             ).grid(row=row, column=8, padx=(4, 2), sticky="w")
 
     _motion_controls.extend([neg_btn, pos_btn, home_btn])
 
-# ── 4. Saved positions (X axis) ────────────────────────────────────────────
-saved_frame = tk.LabelFrame(root, text="Saved Positions  (X axis)", padx=4, pady=4)
-saved_frame.pack(fill="x", **PAD)
+btn_row = tk.Frame(axes_frame)
+btn_row.grid(row=3, column=0, columnspan=9, pady=(6, 2))
 
-saved_labels: dict[str, tk.StringVar] = {}
+go_all_btn = _make_btn(btn_row, text="Go", width=10, state="disabled",
+                       command=go_all_axes)
+go_all_btn.pack(side="left", padx=4)
 
-for slot in ("Pickup", "Drop"):
-    sf = tk.Frame(saved_frame)
-    sf.pack(side="left", padx=12, pady=2)
+home_all_btn = _make_btn(btn_row, text="Home All", width=10, state="disabled",
+                         command=home_all_axes)
+home_all_btn.pack(side="left", padx=4)
 
-    tk.Label(sf, text=f"{slot}:", width=7, anchor="w").pack(side="left")
+_motion_controls.extend([go_all_btn, home_all_btn])
 
-    lv = tk.StringVar(value="—")
-    saved_labels[slot] = lv
-    tk.Label(sf, textvariable=lv, width=10, anchor="w").pack(side="left")
-
-    _make_btn(sf, text="Save", command=lambda s=slot: save_position(s)).pack(side="left", padx=2)
-
-    go_btn = _make_btn(sf, text="Go", state="disabled",
-                       command=lambda s=slot: go_to_saved(s))
-    go_btn.pack(side="left", padx=2)
-    _motion_controls.append(go_btn)
-
-# ── 5. Log pane ────────────────────────────────────────────────────────────
-log_frame = tk.LabelFrame(root, text="Log", padx=4, pady=4)
+# ── 4. Log pane ────────────────────────────────────────────────────────────
+log_frame = tk.LabelFrame(right_frame, text="Log", padx=4, pady=4)
 log_frame.pack(fill="both", expand=True, **PAD)
 
 log_text = tk.Text(log_frame, height=10, state="disabled", wrap="word",

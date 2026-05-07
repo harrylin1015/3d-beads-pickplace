@@ -135,6 +135,51 @@ void stepZ(long steps) {
   }
 }
 
+// ── Coordinated multi-axis motion (Bresenham) ──────────────────────────────
+// Interleaves step pulses so all axes move simultaneously.
+// The dominant axis (most steps) sets the pace; lesser axes step at the
+// proportionally correct sub-intervals — no hardware changes required.
+void stepMulti(long xSteps, long ySteps, long zSteps) {
+  // Set directions
+  digitalWrite(PIN_X_DIR, xSteps >= 0 ? DIR_X_FWD : DIR_X_BWD);
+  digitalWrite(PIN_Y_DIR, ySteps >= 0 ? DIR_Y_FWD : DIR_Y_BWD);
+  bool zFwd = (zSteps >= 0);
+  digitalWrite(PIN_Z1_DIR, zFwd ? DIR_Z_FWD : DIR_Z_BWD);
+  digitalWrite(PIN_Z2_DIR, (Z2_INVERT ? !zFwd : zFwd) ? DIR_Z_FWD : DIR_Z_BWD);
+  delayMicroseconds(DIR_SETTLE_US);
+
+  long ax = abs(xSteps);
+  long ay = abs(ySteps);
+  long az = abs(zSteps);
+  long dom = max(ax, max(ay, az));
+  if (dom == 0) return;
+
+  // Initialise error accumulators at dom/2 for symmetric rounding.
+  long errX = dom / 2;
+  long errY = dom / 2;
+  long errZ = dom / 2;
+
+  for (long i = 0; i < dom; i++) {
+    bool doX = false, doY = false, doZ = false;
+
+    errX += ax; if (errX >= dom) { errX -= dom; doX = true; }
+    errY += ay; if (errY >= dom) { errY -= dom; doY = true; }
+    errZ += az; if (errZ >= dom) { errZ -= dom; doZ = true; }
+
+    if (doX) digitalWrite(PIN_X_STEP,  HIGH);
+    if (doY) digitalWrite(PIN_Y_STEP,  HIGH);
+    if (doZ) { digitalWrite(PIN_Z1_STEP, HIGH); digitalWrite(PIN_Z2_STEP, HIGH); }
+
+    delayMicroseconds(STEP_PULSE_US);
+
+    if (doX) digitalWrite(PIN_X_STEP,  LOW);
+    if (doY) digitalWrite(PIN_Y_STEP,  LOW);
+    if (doZ) { digitalWrite(PIN_Z1_STEP, LOW);  digitalWrite(PIN_Z2_STEP, LOW);  }
+
+    delayMicroseconds(stepDelayUs);
+  }
+}
+
 // ── Command parser ─────────────────────────────────────────────────────────
 void processCommand(String cmd) {
   cmd.trim();
@@ -152,7 +197,7 @@ void processCommand(String cmd) {
     return;
   }
 
-  // X/Y/Z ± <n> — move axis
+  // X/Y/Z ± <n> — move single axis
   long steps;
   if (cmd.startsWith("X") && parseMoveArg(cmd.substring(1), steps)) {
     stepX(steps); Serial.println("DONE"); return;
@@ -162,6 +207,29 @@ void processCommand(String cmd) {
   }
   if (cmd.startsWith("Z") && parseMoveArg(cmd.substring(1), steps)) {
     stepZ(steps); Serial.println("DONE"); return;
+  }
+
+  // M [X±n] [Y±n] [Z±n] — move multiple axes simultaneously (Bresenham)
+  if (cmd == "M" || cmd.startsWith("M ")) {
+    long xS = 0, yS = 0, zS = 0;
+    String rest = cmd.substring(1);
+    rest.trim();
+    while (rest.length() > 0) {
+      int sp = rest.indexOf(' ');
+      String token = (sp < 0) ? rest : rest.substring(0, sp);
+      rest = (sp < 0) ? "" : rest.substring(sp + 1);
+      rest.trim();
+      if (token.length() < 2) continue;
+      char axis = token.charAt(0);
+      long s;
+      if (!parseMoveArg(token.substring(1), s)) continue;
+      if      (axis == 'X') xS = s;
+      else if (axis == 'Y') yS = s;
+      else if (axis == 'Z') zS = s;
+    }
+    stepMulti(xS, yS, zS);
+    Serial.println("DONE");
+    return;
   }
 
   sendErr(cmd);
