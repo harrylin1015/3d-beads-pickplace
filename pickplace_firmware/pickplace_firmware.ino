@@ -1,8 +1,11 @@
 // pickplace_firmware.ino
 // X / Y / Z-axis controller for a pick-and-place (modified 3D printer).
 // Z axis uses two synced motors (Z1 + Z2).
+// Claw is a servo on pin A1.
 // Runs on a Raspberry Pi Pico W via the Arduino framework.
 // Communicates over USB CDC serial (Serial object = USB on the Pico W).
+
+#include <Servo.h>
 
 // ── Pin constants ──────────────────────────────────────────────────────────
 const int PIN_X_STEP  = 16;
@@ -15,6 +18,8 @@ const int PIN_Z1_STEP = 18;   // first Z motor
 const int PIN_Z1_DIR  = 19;
 const int PIN_Z2_STEP = 13;   // second Z motor (synced with Z1)
 const int PIN_Z2_DIR  = 12;
+
+const int PIN_CLAW = 27;      // servo signal pin for claw (GP27 = A1)
 
 // ── Timing constants ───────────────────────────────────────────────────────
 const unsigned long DEFAULT_DELAY = 5000;  // µs between steps (lower = faster)
@@ -41,6 +46,7 @@ const bool Z2_INVERT = true;
 
 // ── Mutable state ──────────────────────────────────────────────────────────
 unsigned long stepDelayUs = DEFAULT_DELAY;
+Servo claw;
 
 // Non-blocking serial accumulator — avoids readStringUntil() timeout lag.
 String serialBuf = "";
@@ -83,6 +89,9 @@ void setup() {
   initAxis(PIN_Y_STEP,  PIN_Y_DIR,  DIR_Y_FWD);
   initAxis(PIN_Z1_STEP, PIN_Z1_DIR, DIR_Z_FWD);
   initAxis(PIN_Z2_STEP, PIN_Z2_DIR, DIR_Z_FWD);
+
+  claw.attach(PIN_CLAW);
+  claw.write(0);
 
   Serial.begin(BAUD_RATE);
   Serial.println("READY");
@@ -187,6 +196,16 @@ void processCommand(String cmd) {
 
   // P — ping
   if (cmd == "P") { Serial.println("PONG"); return; }
+
+  // C<angle> — set claw servo angle (0–180°)
+  if (cmd.startsWith("C")) {
+    String arg = cmd.substring(1);
+    if (!allDigits(arg)) { sendErr(cmd); return; }
+    int angle = constrain(arg.toInt(), 0, 180);
+    claw.write(angle);
+    Serial.println("DONE");
+    return;
+  }
 
   // S<µs> — set inter-step delay
   if (cmd.startsWith("S")) {

@@ -4,7 +4,7 @@ Desktop controller for a pick-and-place machine (X, Y, Z axes).
 Talks to a Raspberry Pi Pico W running pickplace_firmware.ino over USB serial.
 
 Protocol (newline-terminated ASCII):
-  Send  → firmware:  X±<n>  Y±<n>  Z±<n>  S<µs>  P
+  Send  → firmware:  X±<n>  Y±<n>  Z±<n>  S<µs>  C<angle>  P
   Reply ← firmware:  DONE   PONG   ERR <cmd>   READY
 
 Dependencies: pyserial  (pip install pyserial)
@@ -21,15 +21,15 @@ import time
 # ── Easy-to-change constants ───────────────────────────────────────────────
 BAUD_RATE     = 9600
 DEFAULT_STEP  = 0       # initial jog step size (steps)
-DEFAULT_SPEED = 2000    # initial inter-step delay sent to firmware (µs)
+DEFAULT_SPEED = {"X": 2500, "Y": 5000, "Z": 4000}  # per-axis inter-step delay (µs)
 POLL_MS       = 50      # how often the main thread drains the reply queue
 BUSY_TIMEOUT  = 10.0    # seconds before the busy flag is force-cleared (watchdog)
 
-STEPS_PER_BEAD = 5      # steps per 5 mm bead width
+STEPS_PER_BEAD = 7      # steps per bead width
 
 AXIS_LIMITS = {
-    "X": (50,   495),
-    "Y": (50,   900),
+    "X": (None, None),
+    "Y": (None, None),
     "Z": (None, None),
 }
 
@@ -44,6 +44,10 @@ pending_action = None   # zero-arg callable invoked when DONE arrives
 # Per-axis position tracking. Values are absolute machine steps.
 axis_pos  = {"X": 0, "Y": 0, "Z": 0}
 axis_zero = {"X": 0, "Y": 0, "Z": 0}  # display = axis_pos − axis_zero
+
+claw_angle = 0   # last commanded servo angle (0–180°)
+
+_firmware_speed = None  # last speed (µs) confirmed sent to firmware
 
 # Thread-safe queue: reader thread writes, main thread reads.
 reply_q: queue.Queue = queue.Queue()
@@ -193,7 +197,10 @@ def do_move(axis: str, delta: int, after=None) -> None:
         if after:
             after()
 
-    send_command(f"{axis}{sign}{delta}", on_done=on_done)
+    def send_move():
+        send_command(f"{axis}{sign}{delta}", on_done=on_done)
+
+    _ensure_speed(_axis_speed(axis), on_ready=send_move)
 
 
 def jog(axis: str, direction: int) -> None:
@@ -248,7 +255,11 @@ def _send_multi(moves: list, after=None) -> None:
         if after:
             after()
 
-    send_command("M " + " ".join(parts), on_done=on_done)
+    def send_move():
+        send_command("M " + " ".join(parts), on_done=on_done)
+
+    us = max(_axis_speed(ax) for ax, _ in moves)
+    _ensure_speed(us, on_ready=send_move)
 
 
 def home_all_axes() -> None:
@@ -291,17 +302,70 @@ def go_home(axis: str) -> None:
     do_move(axis, delta)
 
 
-def set_speed() -> None:
+def _axis_speed(axis: str) -> int:
     try:
-        us = int(speed_var.get())
+        us = int(speed_vars[axis].get())
+        return us if us > 0 else DEFAULT_SPEED[axis]
+    except (ValueError, KeyError):
+        return DEFAULT_SPEED.get(axis, 2000)
+
+
+def _ensure_speed(us: int, on_ready) -> None:
+    global _firmware_speed
+    if us != _firmware_speed:
+        _firmware_speed = us
+        send_command(f"S{us}", on_done=on_ready)
+    else:
+        on_ready()
+
+
+def set_speed(axis: str) -> None:
+    global _firmware_speed
+    try:
+        us = int(speed_vars[axis].get())
         if us <= 0:
             raise ValueError
     except ValueError:
-        _log("invalid speed — must be a positive integer (µs)")
+        _log(f"invalid speed for {axis} — must be a positive integer (µs)")
         return
-    send_command(f"S{us}")
+    def on_done():
+        global _firmware_speed
+        _firmware_speed = us
+    send_command(f"S{us}", on_done=on_done)
 
 
+
+
+def send_claw(angle: int, after=None) -> None:
+    global claw_angle
+    angle = max(0, min(180, angle))
+    def on_done():
+        global claw_angle
+        claw_angle = angle
+        claw_angle_var.set(str(angle))
+        if after:
+            after()
+    send_command(f"C{angle}", on_done=on_done)
+
+
+def claw_jog(delta: int) -> None:
+    try:
+        step = int(claw_step_var.get())
+        if step <= 0:
+            raise ValueError
+    except ValueError:
+        _log("invalid claw step — must be a positive integer")
+        return
+    send_claw(claw_angle + delta * step)
+
+
+def claw_set() -> None:
+    try:
+        angle = int(claw_angle_var.get())
+    except ValueError:
+        _log("invalid claw angle — must be an integer 0–180")
+        return
+    send_claw(angle)
 
 
 # ── Connection management ──────────────────────────────────────────────────
@@ -430,11 +494,9 @@ _COL_EMPTY  = "#555555"
 _COL_FILLED = "#ffffff"
 _COL_DONE   = "#00cc44"
 
-# Grid origin: centre the 10×10 bead grid in the usable work area
-_X_LO, _X_HI = AXIS_LIMITS["X"]
-_Y_LO, _Y_HI = AXIS_LIMITS["Y"]
-GRID_X_ORIGIN = (_X_LO + _X_HI) // 2 - (_GRID_N * STEPS_PER_BEAD) // 2
-GRID_Y_ORIGIN = (_Y_LO + _Y_HI) // 2 - (_GRID_N * STEPS_PER_BEAD) // 2
+# Grid origin: top-left corner of the 10×10 bead grid in machine steps
+GRID_X_ORIGIN = 250
+GRID_Y_ORIGIN = 453
 
 grid_state = [[False] * _GRID_N for _ in range(_GRID_N)]
 
@@ -514,6 +576,15 @@ def clear_grid() -> None:
                 _set_cell(r, c, False)
 
 
+Z_HOME      = 0     # right above beads (starting/resting position)
+Z_PICK      = -295  # lowered to grip bead (Z_HOME − 295)
+Z_TRANSPORT = 200   # raised for travel (Z_PICK + 250)
+Z_DROP      = 0     # drop height (Z_TRANSPORT − 100, same level as Z_HOME)
+CLAW_OPEN   = 90    # servo degrees — claw open (not gripping)
+CLAW_CLOSED = 0     # servo degrees — claw closed (gripping)
+SERVO_MS    = 600   # ms to wait after a claw command for servo to reach position
+
+
 def run_pattern() -> None:
     cells = [(r, c) for r in range(_GRID_N) for c in range(_GRID_N) if grid_state[r][c]]
     if not cells:
@@ -522,47 +593,119 @@ def run_pattern() -> None:
 
     _log(f"starting pattern: {len(cells)} bead(s)")
 
-    x_center = (_X_LO + _X_HI) // 2
-    y_center = (_Y_LO + _Y_HI) // 2
-
-    def return_to_zero():
-        dx = -axis_pos["X"]
-        dy = -axis_pos["Y"]
-        _log(f"returning to zero → X=0 Y=0  (Δx={dx:+d} Δy={dy:+d})")
-        parts = [f"{ax}{'+' if d > 0 else ''}{d}" for ax, d in (("X", dx), ("Y", dy)) if d != 0]
-        if not parts:
-            return
-        def on_done():
-            axis_pos["X"] = 0
-            axis_pos["Y"] = 0
-            _refresh_pos_labels()
-        send_command("M " + " ".join(parts), on_done=on_done)
+    def final_home():
+        # Home order: X → Z(home) → Y → close claw
+        _log("done — homing X")
+        dx = axis_zero["X"] - axis_pos["X"]
+        def after_x():
+            _log(f"homing Z → {Z_HOME}")
+            dz = Z_HOME - axis_pos["Z"]
+            def after_z():
+                _log("homing Y")
+                dy = axis_zero["Y"] - axis_pos["Y"]
+                def after_y():
+                    _log("closing claw")
+                    send_claw(CLAW_CLOSED, after=lambda: _log("pattern complete"))
+                if dy != 0:
+                    do_move("Y", dy, after=after_y)
+                else:
+                    after_y()
+            if dz != 0:
+                do_move("Z", dz, after=after_z)
+            else:
+                after_z()
+        if dx != 0:
+            do_move("X", dx, after=after_x)
+        else:
+            after_x()
 
     def place_next(remaining):
         if not remaining:
-            _log("pattern complete")
-            return_to_zero()
+            final_home()
             return
+
         row, col = remaining[0]
         x_target = GRID_X_ORIGIN + col * STEPS_PER_BEAD
         y_target = GRID_Y_ORIGIN + row * STEPS_PER_BEAD
-        dx = x_target - axis_pos["X"]
-        dy = y_target - axis_pos["Y"]
-        _log(f"grid ({row},{col}) → X={x_target} Y={y_target}  (Δx={dx:+d} Δy={dy:+d})")
-        moves = [(ax, d) for ax, d in (("X", dx), ("Y", dy)) if d != 0]
+        _log(f"bead ({row},{col}): opening claw")
 
-        def on_placed():
-            grid_canvas.itemconfig(_cell_ids[row][col], fill=_COL_DONE)
-            place_next(remaining[1:])
+        # helper — wraps a callback with a servo settle delay
+        def _after_servo(cb):
+            return lambda: root.after(SERVO_MS, cb)
 
-        _send_multi(moves, after=on_placed)
+        # 1 — open claw (at Z_HOME, above beads)
+        def after_claw_open():
+            # 2 — lower Z to pick position
+            _log(f"  Z → {Z_PICK} (lower to grip)")
+            def after_z_pick():
+                # 3 — close claw to grip bead
+                _log("  claw closes (grip)")
+                def after_claw_close():
+                    # 4 — raise Z to transport height
+                    _log(f"  Z → {Z_TRANSPORT} (raise for travel)")
+                    def after_z_transport():
+                        # 5 — move XY to drop target
+                        dx = x_target - axis_pos["X"]
+                        dy = y_target - axis_pos["Y"]
+                        _log(f"  XY → ({x_target}, {y_target})  (Δx={dx:+d} Δy={dy:+d})")
+                        moves = [(ax, d) for ax, d in (("X", dx), ("Y", dy)) if d != 0]
+                        def after_xy():
+                            # 6 — lower Z to drop height
+                            _log(f"  Z → {Z_DROP} (drop position)")
+                            def after_z_drop():
+                                # 7 — open claw to release
+                                _log("  claw opens (drop)")
+                                def after_claw_drop():
+                                    grid_canvas.itemconfig(_cell_ids[row][col], fill=_COL_DONE)
+                                    # 8 — raise Z back to transport height
+                                    _log(f"  Z → {Z_TRANSPORT} (raise after drop)")
+                                    def after_z_raise():
+                                        # 9 — return XY home
+                                        dx_h = axis_zero["X"] - axis_pos["X"]
+                                        dy_h = axis_zero["Y"] - axis_pos["Y"]
+                                        _log(f"  XY → (0, 0)  (Δx={dx_h:+d} Δy={dy_h:+d})")
+                                        moves_h = [(ax, d) for ax, d in (("X", dx_h), ("Y", dy_h)) if d != 0]
+                                        def after_xy_home():
+                                            # 10 — lower Z to home (above beads)
+                                            _log(f"  Z → {Z_HOME} (lower to pickup height)")
+                                            dz_home = Z_HOME - axis_pos["Z"]
+                                            if dz_home != 0:
+                                                do_move("Z", dz_home, after=lambda: place_next(remaining[1:]))
+                                            else:
+                                                place_next(remaining[1:])
+                                        if moves_h:
+                                            _send_multi(moves_h, after=after_xy_home)
+                                        else:
+                                            after_xy_home()
+                                    dz_raise = Z_TRANSPORT - axis_pos["Z"]
+                                    if dz_raise != 0:
+                                        do_move("Z", dz_raise, after=after_z_raise)
+                                    else:
+                                        after_z_raise()
+                                send_claw(CLAW_OPEN, after=_after_servo(after_claw_drop))
+                            dz_drop = Z_DROP - axis_pos["Z"]
+                            if dz_drop != 0:
+                                do_move("Z", dz_drop, after=after_z_drop)
+                            else:
+                                after_z_drop()
+                        if moves:
+                            _send_multi(moves, after=after_xy)
+                        else:
+                            after_xy()
+                    dz_transport = Z_TRANSPORT - axis_pos["Z"]
+                    if dz_transport != 0:
+                        do_move("Z", dz_transport, after=after_z_transport)
+                    else:
+                        after_z_transport()
+                send_claw(CLAW_CLOSED, after=_after_servo(after_claw_close))
+            dz_pick = Z_PICK - axis_pos["Z"]
+            if dz_pick != 0:
+                do_move("Z", dz_pick, after=after_z_pick)
+            else:
+                after_z_pick()
+        send_claw(CLAW_OPEN, after=_after_servo(after_claw_open))
 
-    # Step 1 — move to centre of work area before starting pattern
-    dx_c = x_center - axis_pos["X"]
-    dy_c = y_center - axis_pos["Y"]
-    _log(f"moving to centre → X={x_center} Y={y_center}  (Δx={dx_c:+d} Δy={dy_c:+d})")
-    _send_multi([(ax, d) for ax, d in (("X", dx_c), ("Y", dy_c)) if d != 0],
-                after=lambda: place_next(cells))
+    place_next(cells)
 
 
 _btn_row = tk.Frame(left_frame)
@@ -584,18 +727,7 @@ conn_btn.pack(side="left", **PAD)
 status_dot = tk.Label(conn_frame, text="●", fg="red", font=("Arial", 16))
 status_dot.pack(side="left", padx=(2, 6))
 
-# ── 2. Motion settings ─────────────────────────────────────────────────────
-motion_frame = tk.LabelFrame(right_frame, text="Motion Settings", padx=4, pady=4)
-motion_frame.pack(fill="x", **PAD)
-
-tk.Label(motion_frame, text="Speed (µs):").pack(side="left")
-speed_var = tk.StringVar(value=str(DEFAULT_SPEED))
-tk.Entry(motion_frame, textvariable=speed_var, width=7).pack(side="left", **PAD)
-
-speed_btn = _make_btn(motion_frame, text="Set Speed", command=set_speed, state="disabled")
-speed_btn.pack(side="left", **PAD)
-
-# ── 3. Axes — jog + position in one compact grid ───────────────────────────
+# ── 2. Axes — jog + position + speed in one compact grid ──────────────────
 #
 #        [−axis]    [+axis]    [Home]    position    [Set Zero]
 #   X:     …
@@ -607,9 +739,8 @@ axes_frame.pack(fill="x", **PAD)
 
 pos_vars: dict[str, tk.StringVar] = {}
 step_vars: dict[str, tk.StringVar] = {}
-_motion_controls: list[tk.Widget] = [speed_btn]  # start with speed_btn; axes buttons added below
-
-axis_max_hint = {"X": "50–495", "Y": "50–900", "Z": ""}
+speed_vars: dict[str, tk.StringVar] = {}
+_motion_controls: list[tk.Widget] = []
 
 for row, axis in enumerate(("X", "Y", "Z")):
     tk.Label(axes_frame, text=f"{axis}", width=2, anchor="e",
@@ -644,13 +775,18 @@ for row, axis in enumerate(("X", "Y", "Z")):
     _make_btn(axes_frame, text="Set Zero",
               command=lambda a=axis: set_zero(a)).grid(row=row, column=7, padx=2)
 
-    tk.Label(axes_frame, text=axis_max_hint[axis], fg="gray", font=("Arial", 9)
-             ).grid(row=row, column=8, padx=(4, 2), sticky="w")
+    spv = tk.StringVar(value=str(DEFAULT_SPEED[axis]))
+    speed_vars[axis] = spv
+    tk.Entry(axes_frame, textvariable=spv, width=7, justify="right").grid(row=row, column=8, padx=2)
+    tk.Label(axes_frame, text="µs").grid(row=row, column=9, padx=(0, 4))
+    spd_btn = _make_btn(axes_frame, text="Set Speed", width=9, state="disabled",
+                        command=lambda a=axis: set_speed(a))
+    spd_btn.grid(row=row, column=10, padx=2)
 
-    _motion_controls.extend([neg_btn, pos_btn, home_btn])
+    _motion_controls.extend([neg_btn, pos_btn, home_btn, spd_btn])
 
 btn_row = tk.Frame(axes_frame)
-btn_row.grid(row=3, column=0, columnspan=9, pady=(6, 2))
+btn_row.grid(row=3, column=0, columnspan=11, pady=(6, 2))
 
 go_all_btn = _make_btn(btn_row, text="Go", width=10, state="disabled",
                        command=go_all_axes)
@@ -661,6 +797,31 @@ home_all_btn = _make_btn(btn_row, text="Home All", width=10, state="disabled",
 home_all_btn.pack(side="left", padx=4)
 
 _motion_controls.extend([go_all_btn, home_all_btn])
+
+# ── 3. Claw ───────────────────────────────────────────────────────────────
+claw_frame = tk.LabelFrame(right_frame, text="Claw", padx=6, pady=6)
+claw_frame.pack(fill="x", **PAD)
+
+close_btn = _make_btn(claw_frame, text="◀  Close", width=10, state="disabled",
+                      command=lambda: claw_jog(-1))
+close_btn.pack(side="left", padx=2)
+
+open_btn = _make_btn(claw_frame, text="Open  ▶", width=10, state="disabled",
+                     command=lambda: claw_jog(+1))
+open_btn.pack(side="left", padx=2)
+
+claw_step_var = tk.StringVar(value="10")
+tk.Entry(claw_frame, textvariable=claw_step_var, width=5, justify="right").pack(side="left", padx=2)
+tk.Label(claw_frame, text="deg").pack(side="left", padx=(0, 16))
+
+claw_angle_var = tk.StringVar(value="0")
+tk.Entry(claw_frame, textvariable=claw_angle_var, width=5, justify="right").pack(side="left", padx=2)
+tk.Label(claw_frame, text="°").pack(side="left", padx=(0, 4))
+claw_set_btn = _make_btn(claw_frame, text="Set", width=6, state="disabled",
+                         command=claw_set)
+claw_set_btn.pack(side="left", padx=2)
+
+_motion_controls.extend([close_btn, open_btn, claw_set_btn])
 
 # ── 4. Log pane ────────────────────────────────────────────────────────────
 log_frame = tk.LabelFrame(right_frame, text="Log", padx=4, pady=4)
